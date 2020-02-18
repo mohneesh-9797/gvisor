@@ -15,8 +15,6 @@
 package ipv6
 
 import (
-	"fmt"
-
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -131,7 +129,7 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 	case header.ICMPv6NeighborSolicit:
 		received.NeighborSolicit.Increment()
-		if pkt.Data.Size() < header.ICMPv6NeighborSolicitMinimumSize || !isNDPValid() {
+		if !isNDPValid() || pkt.Data.Size() < header.ICMPv6NeighborSolicitMinimumSize {
 			received.Invalid.Increment()
 			return
 		}
@@ -141,14 +139,14 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 		// NDP messages cannot be fragmented. Also note that in the common case NDP
 		// datagrams are very small and ToView() will not incur allocations.
 		ns := header.NDPNeighborSolicit(payload.ToView())
-		it, err := ns.Options().Iter(true)
-		if err != nil {
-			// If we have a malformed NDP NS option, drop the packet.
+		targetAddr := ns.TargetAddress()
+
+		// As per RFC 4861 section 4.3, the Target Address MUST NOT be a multicast address.
+		if header.IsV6MulticastAddress(targetAddr) {
 			received.Invalid.Increment()
 			return
 		}
 
-		targetAddr := ns.TargetAddress()
 		s := r.Stack()
 		if isTentative, err := s.IsAddrTentative(e.nicID, targetAddr); err != nil {
 			// We will only get an error if the NIC is unrecognized, which should not
@@ -181,22 +179,26 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 		// so the packet is processed as defined in RFC 4861, as per RFC 4862
 		// section 5.4.3.
 
-		// Is the NS targetting us?
-		if e.linkAddrCache.CheckLocalAddress(e.nicID, ProtocolNumber, targetAddr) == 0 {
+		// Is the NS targeting us?
+		if s.CheckLocalAddress(e.nicID, ProtocolNumber, targetAddr) == 0 {
 			return
 		}
 
-		// If the NS message contains the Source Link-Layer Address option, update
-		// the link address cache with the value of the option.
-		//
-		// TODO(b/148429853): Properly process the NS message and do Neighbor
-		// Unreachability Detection.
+		it, err := ns.Options().Iter(false)
+		if err != nil {
+			// If we have a malformed NDP NS option, drop the packet.
+			received.Invalid.Increment()
+			return
+		}
+
 		var sourceLinkAddr tcpip.LinkAddress
+
 		for {
 			opt, done, err := it.Next()
 			if err != nil {
-				// This should never happen as Iter(true) above did not return an error.
-				panic(fmt.Sprintf("unexpected error when iterating over NDP options: %s", err))
+				// If we have a malformed NDP NS option, drop the packet.
+				received.Invalid.Increment()
+				return
 			}
 			if done {
 				break
@@ -232,7 +234,7 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 			received.Invalid.Increment()
 			return
 		} else {
-			e.linkAddrCache.AddLinkAddress(e.nicID, r.RemoteAddress, sourceLinkAddr)
+			e.nud.HandleProbe(r.RemoteAddress, r.LocalAddress, header.IPv6ProtocolNumber, sourceLinkAddr)
 		}
 
 		// ICMPv6 Neighbor Solicit messages are always sent to
@@ -298,7 +300,7 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 	case header.ICMPv6NeighborAdvert:
 		received.NeighborAdvert.Increment()
-		if pkt.Data.Size() < header.ICMPv6NeighborAdvertSize || !isNDPValid() {
+		if !isNDPValid() || pkt.Data.Size() < header.ICMPv6NeighborAdvertSize {
 			received.Invalid.Increment()
 			return
 		}
@@ -308,17 +310,11 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 		// 5, NDP messages cannot be fragmented. Also note that in the common case
 		// NDP datagrams are very small and ToView() will not incur allocations.
 		na := header.NDPNeighborAdvert(payload.ToView())
-		it, err := na.Options().Iter(true)
-		if err != nil {
-			// If we have a malformed NDP NA option, drop the packet.
-			received.Invalid.Increment()
-			return
-		}
-
 		targetAddr := na.TargetAddress()
-		stack := r.Stack()
+		s := r.Stack()
+		rxNICID := e.nicID
 
-		if isTentative, err := stack.IsAddrTentative(e.nicID, targetAddr); err != nil {
+		if isTentative, err := s.IsAddrTentative(rxNICID, targetAddr); err != nil {
 			// We will only get an error if the NIC is unrecognized, which should not
 			// happen. For now short-circuit this packet.
 			//
@@ -329,7 +325,14 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 			// DAD on, implying the address is not unique. In this case we let the
 			// stack know so it can handle such a scenario and do nothing furthur with
 			// the NDP NA.
-			stack.DupTentativeAddrDetected(e.nicID, targetAddr)
+			s.DupTentativeAddrDetected(e.nicID, targetAddr)
+			return
+		}
+
+		it, err := na.Options().Iter(false)
+		if err != nil {
+			// If we have a malformed NDP NA option, drop the packet.
+			received.Invalid.Increment()
 			return
 		}
 
@@ -342,18 +345,13 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 		// TODO(b/143147598): Handle the scenario described above. Also inform the
 		// netstack integration that a duplicate address was detected outside of
 		// DAD.
-
-		// If the NA message has the target link layer option, update the link
-		// address cache with the link address for the target of the message.
-		//
-		// TODO(b/148429853): Properly process the NA message and do Neighbor
-		// Unreachability Detection.
 		var targetLinkAddr tcpip.LinkAddress
 		for {
 			opt, done, err := it.Next()
 			if err != nil {
-				// This should never happen as Iter(true) above did not return an error.
-				panic(fmt.Sprintf("unexpected error when iterating over NDP options: %s", err))
+				// This option is not valid as per the wire format, silently drop the packet.
+				received.Invalid.Increment()
+				return
 			}
 			if done {
 				break
@@ -373,8 +371,14 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 			}
 		}
 
+		// If the NA message has the target link layer option, update the link
+		// address cache with the link address for the target of the message.
 		if len(targetLinkAddr) != 0 {
-			e.linkAddrCache.AddLinkAddress(e.nicID, targetAddr, targetLinkAddr)
+			e.nud.HandleConfirmation(targetAddr, targetLinkAddr, stack.ReachabilityConfirmationFlags{
+				Solicited: na.SolicitedFlag(),
+				Override:  na.OverrideFlag(),
+				IsRouter:  na.RouterFlag(),
+			})
 		}
 
 	case header.ICMPv6EchoRequest:
@@ -415,17 +419,87 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 	case header.ICMPv6RouterSolicit:
 		received.RouterSolicit.Increment()
-		if !isNDPValid() {
+
+		// Is the NDP payload of sufficient size to hold a Router Solictation?
+		if !isNDPValid() || pkt.Data.Size()-header.ICMPv6HeaderSize < header.NDPRSMinimumSize {
 			received.Invalid.Increment()
 			return
+		}
+
+		//
+		// Validate the RS as per RFC 4861 section 6.1.1.
+		//
+
+		stack := r.Stack()
+
+		// Is the networking stack operating as a router?
+		if !stack.Forwarding() {
+			// ... No, silently drop the packet.
+			received.Invalid.Increment()
+			return
+		}
+
+		// The remainder of payload must be only the router solicitation, so
+		// payload.ToView() always returns the solicitation. Per RFC 6980 section
+		// 5, NDP messages cannot be fragmented. Also note that in the common case
+		// NDP datagrams are very small and ToView() will not incur allocations.
+		rs := header.NDPRouterSolicit(payload.ToView())
+		it, err := rs.Options().Iter(false)
+		if err != nil {
+			// Options are not valid as per the wire format, silently drop the packet.
+			received.Invalid.Increment()
+			return
+		}
+
+		var sourceLinkAddr tcpip.LinkAddress
+		for {
+			opt, done, err := it.Next()
+			if err != nil {
+				// Options are not valid as per the wire format, silently drop the packet.
+				received.Invalid.Increment()
+				return
+			}
+			if done {
+				break
+			}
+
+			switch opt := opt.(type) {
+			case header.NDPSourceLinkLayerAddressOption:
+				// No RFCs define what to do when an RS message has multiple Source
+				// Link-Layer Address options. Since no interface can have multiple
+				// link-layer addresses, we consider such messages invalid.
+				if len(sourceLinkAddr) != 0 {
+					received.Invalid.Increment()
+					return
+				}
+
+				sourceLinkAddr = opt.EthernetAddress()
+			}
+		}
+
+		unspecifiedSource := r.RemoteAddress == header.IPv6Any
+
+		// If the RS message has the source link layer option, update the link
+		// address cache with the link address for the source of the message.
+		if len(sourceLinkAddr) != 0 {
+			// As per RFC 4861 section 4.1, the Source Link-Layer Address Option MUST
+			// NOT be included when the source IP address is the unspecified address.
+			// Otherwise, it SHOULD be included on link layers that have addresses.
+			if unspecifiedSource {
+				received.Invalid.Increment()
+				return
+			}
+
+			// A RS with a specified source IP address modifies the NUD state machine
+			// in the same way a reachability probe would.
+			e.nud.HandleProbe(r.RemoteAddress, r.LocalAddress, header.IPv6ProtocolNumber, sourceLinkAddr)
 		}
 
 	case header.ICMPv6RouterAdvert:
 		received.RouterAdvert.Increment()
 
-		// Is the NDP payload of sufficient size to hold a Router
-		// Advertisement?
-		if pkt.Data.Size()-header.ICMPv6HeaderSize < header.NDPRAMinimumSize || !isNDPValid() {
+		// Is the NDP payload of sufficient size to hold a Router Advertisement?
+		if !isNDPValid() || pkt.Data.Size()-header.ICMPv6HeaderSize < header.NDPRAMinimumSize {
 			received.Invalid.Increment()
 			return
 		}
@@ -448,11 +522,9 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 		// 5, NDP messages cannot be fragmented. Also note that in the common case
 		// NDP datagrams are very small and ToView() will not incur allocations.
 		ra := header.NDPRouterAdvert(payload.ToView())
-		opts := ra.Options()
-
-		// Are options valid as per the wire format?
-		if _, err := opts.Iter(true); err != nil {
-			// ...No, silently drop the packet.
+		it, err := ra.Options().Iter(false)
+		if err != nil {
+			// Options are not valid as per the wire format, silently drop the packet.
 			received.Invalid.Increment()
 			return
 		}
@@ -464,10 +536,45 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 		// Tell the NIC to handle the RA.
 		stack := r.Stack()
-		rxNICID := r.NICID()
+		rxNICID := e.nicID
 		stack.HandleNDPRA(rxNICID, routerAddr, ra)
 
+		// If the RA has the source link layer option, update the link address
+		// cache with the link address for the advertised router.
+		for {
+			opt, done, err := it.Next()
+			if err != nil {
+				// This option is not valid as per the wire format, silently drop the packet.
+				received.Invalid.Increment()
+				return
+			}
+			if done {
+				break
+			}
+
+			switch opt := opt.(type) {
+			case header.NDPSourceLinkLayerAddressOption:
+				e.nud.HandleProbe(routerAddr, r.LocalAddress, header.IPv6ProtocolNumber, opt.EthernetAddress())
+			}
+		}
+
 	case header.ICMPv6RedirectMsg:
+		// TODO(gvisor.dev/issue/2285): Call `e.nud.HandleProbe` after validating
+		// this redirect message, as per RFC 4871 section 7.3.3:
+		//
+		//    "A Neighbor Cache entry enters the STALE state when created as a
+		//    result of receiving packets other than solicited Neighbor
+		//    Advertisements (i.e., Router Solicitations, Router Advertisements,
+		//    Redirects, and Neighbor Solicitations).  These packets contain the
+		//    link-layer address of either the sender or, in the case of Redirect,
+		//    the redirection target.  However, receipt of these link-layer
+		//    addresses does not confirm reachability of the forward-direction path
+		//    to that node.  Placing a newly created Neighbor Cache entry for which
+		//    the link-layer address is known in the STALE state provides assurance
+		//    that path failures are detected quickly. In addition, should a cached
+		//    link-layer address be modified due to receiving one of the above
+		//    messages, the state SHOULD also be set to STALE to provide prompt
+		//    verification that the path to the new link-layer address is working."
 		received.RedirectMsg.Increment()
 		if !isNDPValid() {
 			received.Invalid.Increment()
@@ -501,7 +608,7 @@ func (*protocol) LinkAddressProtocol() tcpip.NetworkProtocolNumber {
 }
 
 // LinkAddressRequest implements stack.LinkAddressResolver.
-func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, linkEP stack.LinkEndpoint) *tcpip.Error {
+func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, linkAddr tcpip.LinkAddress, linkEP stack.LinkEndpoint) *tcpip.Error {
 	snaddr := header.SolicitedNodeAddr(addr)
 
 	// TODO(b/148672031): Use stack.FindRoute instead of manually creating the
@@ -510,8 +617,12 @@ func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, linkEP stack.
 	r := &stack.Route{
 		LocalAddress:      localAddr,
 		RemoteAddress:     snaddr,
-		RemoteLinkAddress: header.EthernetAddressFromMulticastIPv6Address(snaddr),
+		RemoteLinkAddress: linkAddr,
 	}
+	if len(r.RemoteLinkAddress) == 0 {
+		r.RemoteLinkAddress = header.EthernetAddressFromMulticastIPv6Address(snaddr)
+	}
+
 	hdr := buffer.NewPrependable(int(linkEP.MaxHeaderLength()) + header.IPv6MinimumSize + header.ICMPv6NeighborAdvertSize)
 	pkt := header.ICMPv6(hdr.Prepend(header.ICMPv6NeighborAdvertSize))
 	pkt.SetType(header.ICMPv6NeighborSolicit)
