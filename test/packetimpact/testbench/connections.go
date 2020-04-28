@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -30,14 +31,43 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
+	"gvisor.dev/gvisor/test/packetimpact/netdevs"
 )
 
-var localIPv4 = flag.String("local_ipv4", "", "local IPv4 address for test packets")
-var remoteIPv4 = flag.String("remote_ipv4", "", "remote IPv4 address for test packets")
-var localIPv6 = flag.String("local_ipv6", "", "local IPv6 address for test packets")
-var remoteIPv6 = flag.String("remote_ipv6", "", "remote IPv6 address for test packets")
-var localMAC = flag.String("local_mac", "", "local mac address for test packets")
-var remoteMAC = flag.String("remote_mac", "", "remote mac address for test packets")
+var (
+	// Flags.
+	localIPv4  = flag.String("local_ipv4", "", "local IPv4 address for test packets")
+	remoteIPv4 = flag.String("remote_ipv4", "", "remote IPv4 address for test packets")
+	remoteIPv6 = flag.String("remote_ipv6", "", "remote IPv6 address for test packets")
+	remoteMAC  = flag.String("remote_mac", "", "remote mac address for test packets")
+
+	// Pseudo-flags. Filled in based on flag information at flag parse time.
+	localIPv6 *string // Local IPv6 address for test packets.
+	localMAC  *string // Local mac address for test packets.
+)
+
+func genPseudoFlags() error {
+	out, err := exec.Command("ip", "addr", "show").Output()
+	if err != nil {
+		return fmt.Errorf("listing devices: %v", err)
+	}
+	devs, err := netdevs.ParseDevices(string(out))
+	if err != nil {
+		return fmt.Errorf("parsing devices: %v", err)
+	}
+
+	_, deviceInfo, err := netdevs.FindDeviceByIP(net.ParseIP(*localIPv4), devs)
+	if err != nil {
+		return fmt.Errorf("can't find deviceInfo: %s", err)
+	}
+
+	mac := deviceInfo.MAC.String()
+	localMAC = &mac
+	v6 := deviceInfo.IPv6Addr.String()
+	localIPv6 = &v6
+
+	return nil
+}
 
 func portFromSockaddr(sa unix.Sockaddr) (uint16, error) {
 	switch sa := sa.(type) {

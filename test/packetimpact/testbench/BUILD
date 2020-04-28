@@ -9,6 +9,7 @@ go_library(
     name = "testbench",
     srcs = [
         "connections.go",
+        "devices.go",
         "dut.go",
         "dut_client.go",
         "layers.go",
@@ -20,6 +21,7 @@ go_library(
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
         "//pkg/usermem",
+        "//test/packetimpact/netdevs",
         "//test/packetimpact/proto:posix_server_go_proto",
         "@com_github_google_go-cmp//cmp:go_default_library",
         "@com_github_google_go-cmp//cmp/cmpopts:go_default_library",

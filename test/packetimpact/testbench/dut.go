@@ -47,7 +47,13 @@ type DUT struct {
 // NewDUT creates a new connection with the DUT over gRPC.
 func NewDUT(t *testing.T) DUT {
 	flag.Parse()
+
+	if err := genPseudoFlags(); err != nil {
+		t.Fatal("generating psuedo flags:", err)
+	}
+
 	posixServerAddress := *posixServerIP + ":" + strconv.Itoa(*posixServerPort)
+
 	conn, err := grpc.Dial(posixServerAddress, grpc.WithInsecure(), grpc.WithKeepaliveParams(keepalive.ClientParameters{Timeout: *rpcKeepalive}))
 	if err != nil {
 		t.Fatalf("failed to grpc.Dial(%s): %s", posixServerAddress, err)
