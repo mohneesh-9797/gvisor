@@ -23,6 +23,7 @@ go_library(
         "read_write.go",
         "setstat.go",
         "socket.go",
+        "splice.go",
         "stat.go",
         "stat_amd64.go",
         "stat_arm64.go",
