@@ -89,11 +89,6 @@ func (s *SocketVFS2) EventUnregister(e *waiter.Entry) {
 	s.socketOpsCommon.EventUnregister(e)
 }
 
-// PRead implements vfs.FileDescriptionImpl.
-func (s *SocketVFS2) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
-	return 0, syserror.ESPIPE
-}
-
 // Read implements vfs.FileDescriptionImpl.
 func (s *SocketVFS2) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	// All flags other than RWF_NOWAIT should be ignored.
@@ -115,11 +110,6 @@ func (s *SocketVFS2) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.
 	return int64(n), nil
 }
 
-// PWrite implements vfs.FileDescriptionImpl.
-func (s *SocketVFS2) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
-	return 0, syserror.ESPIPE
-}
-
 // Write implements vfs.FileDescriptionImpl.
 func (s *SocketVFS2) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	// All flags other than RWF_NOWAIT should be ignored.
@@ -135,11 +125,11 @@ func (s *SocketVFS2) Write(ctx context.Context, src usermem.IOSequence, opts vfs
 	}
 
 	if resCh != nil {
-		t := kernel.TaskFromContext(ctx)
-		if err := t.Block(resCh); err != nil {
-			return 0, syserr.FromError(err).ToError()
-		}
-
+		// TODO(b/156015175): Make this wait interruptible when the caller is a
+		// task goroutine.
+		ctx.UninterruptibleSleepStart(true)
+		<-resCh
+		ctx.UninterruptibleSleepFinish(true)
 		n, _, err = s.Endpoint.Write(f, tcpip.WriteOptions{})
 	}
 

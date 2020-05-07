@@ -553,11 +553,11 @@ func (s *SocketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IO
 	}
 
 	if resCh != nil {
-		t := kernel.TaskFromContext(ctx)
-		if err := t.Block(resCh); err != nil {
-			return 0, syserr.FromError(err).ToError()
-		}
-
+		// TODO(b/156015175): Make this wait interruptible when the caller is a
+		// task goroutine.
+		ctx.UninterruptibleSleepStart(true)
+		<-resCh
+		ctx.UninterruptibleSleepFinish(true)
 		n, _, err = s.Endpoint.Write(f, tcpip.WriteOptions{})
 	}
 
@@ -626,11 +626,11 @@ func (s *SocketOperations) ReadFrom(ctx context.Context, _ *fs.File, r io.Reader
 	}
 
 	if resCh != nil {
-		t := kernel.TaskFromContext(ctx)
-		if err := t.Block(resCh); err != nil {
-			return 0, syserr.FromError(err).ToError()
-		}
-
+		// TODO(b/156015175): Make this wait interruptible when the caller is a
+		// task goroutine.
+		ctx.UninterruptibleSleepStart(true)
+		<-resCh
+		ctx.UninterruptibleSleepFinish(true)
 		n, _, err = s.Endpoint.Write(f, tcpip.WriteOptions{
 			Atomic: true, // See above.
 		})
