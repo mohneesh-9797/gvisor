@@ -52,7 +52,6 @@ go_library(
         "//pkg/sentry/fs",
         "//pkg/sentry/fs/fsutil",
         "//pkg/sentry/fs/lock",
-        "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/pipe",
         "//pkg/sentry/kernel/time",
@@ -96,6 +95,7 @@ go_test(
         "pipe_test.go",
         "regular_file_test.go",
         "stat_test.go",
+        "tmpfs_test.go",
     ],
     library = ":tmpfs",
     deps = [
@@ -105,7 +105,6 @@ go_test(
         "//pkg/sentry/contexttest",
         "//pkg/sentry/fs/lock",
         "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/kernel/contexttest",
         "//pkg/sentry/vfs",
         "//pkg/syserror",
         "//pkg/usermem",
