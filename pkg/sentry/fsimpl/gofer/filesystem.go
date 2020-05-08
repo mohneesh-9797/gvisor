@@ -855,7 +855,8 @@ func (d *dentry) openSpecialFileLocked(ctx context.Context, mnt *vfs.Mount, opts
 		return nil, err
 	}
 	fd := &specialFileFD{
-		handle: h,
+		handle:    h,
+		allowSeek: d.fileType() == linux.S_IFREG,
 	}
 	if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 		h.close(ctx)
@@ -888,7 +889,11 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	}
 	creds := rp.Credentials()
 	name := rp.Component()
-	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, (p9.OpenFlags)(opts.Flags), (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
+	// Filter file creation flags and O_LARGEFILE out; the create RPC already
+	// has the semantics of O_CREAT|O_EXCL, while some servers will choke on
+	// O_LARGEFILE.
+	createFlags := p9.OpenFlags(opts.Flags &^ (linux.O_CREAT | linux.O_EXCL | linux.O_TRUNC | linux.O_LARGEFILE))
+	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, createFlags, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
 	if err != nil {
 		dirfile.close(ctx)
 		return nil, err
@@ -896,24 +901,13 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	// Then we need to walk to the file we just created to get a non-open fid
 	// representing it, and to get its metadata. This must use d.file since, as
 	// explained above, dirfile was invalidated by dirfile.Create().
-	walkQID, nonOpenFile, attrMask, attr, err := d.file.walkGetAttrOne(ctx, name)
+	_, nonOpenFile, attrMask, attr, err := d.file.walkGetAttrOne(ctx, name)
 	if err != nil {
 		openFile.close(ctx)
 		if fdobj != nil {
 			fdobj.Close()
 		}
 		return nil, err
-	}
-	// Sanity-check that we walked to the file we created.
-	if createQID.Path != walkQID.Path {
-		// Probably due to concurrent remote filesystem mutation?
-		ctx.Warningf("gofer.dentry.createAndOpenChildLocked: created file has QID %v before walk, QID %v after (interop=%v)", createQID, walkQID, d.fs.opts.interop)
-		nonOpenFile.close(ctx)
-		openFile.close(ctx)
-		if fdobj != nil {
-			fdobj.Close()
-		}
-		return nil, syserror.EAGAIN
 	}
 
 	// Construct the new dentry.
@@ -965,6 +959,7 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 				file: openFile,
 				fd:   -1,
 			},
+			allowSeek: child.fileType() == linux.S_IFREG,
 		}
 		if fdobj != nil {
 			fd.handle.fd = int32(fdobj.Release())

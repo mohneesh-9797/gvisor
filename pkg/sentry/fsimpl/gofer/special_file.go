@@ -33,8 +33,9 @@ import (
 type specialFileFD struct {
 	fileDescription
 
-	// handle is immutable.
-	handle handle
+	// These fields are immutable.
+	handle    handle
+	allowSeek bool
 
 	// off is the file offset. off is protected by mu. (POSIX 2.9.7 only
 	// requires operations using the file offset to be atomic for regular files
@@ -139,6 +140,9 @@ func (fd *specialFileFD) Write(ctx context.Context, src usermem.IOSequence, opts
 
 // Seek implements vfs.FileDescriptionImpl.Seek.
 func (fd *specialFileFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
+	if !fd.allowSeek {
+		return 0, syserror.ESPIPE
+	}
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	switch whence {
